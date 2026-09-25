@@ -1,33 +1,112 @@
 package be.autotoggle
 
+import android.content.ComponentName
 import android.content.Context
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.os.IBinder
 import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuRemoteProcess
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 object AutoController {
-    // Current Android Auto package on Google/Samsung builds.
-    const val AA = "com.google.android.projection.gearhead"
-    const val REQ = 42
 
-    fun shizukuRunning() = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
-    fun hasPermission() = shizukuRunning() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-    fun requestPermission() { if (shizukuRunning()) Shizuku.requestPermission(REQ) }
+    private const val ANDROID_AUTO =
+        "com.google.android.projection.gearhead"
 
-    fun isEnabled(context: Context): Boolean = try {
-        val ai = context.packageManager.getApplicationInfo(AA, PackageManager.ApplicationInfoFlags.of(0))
-        ai.enabled
-    } catch (_: Throwable) { true }
-
-    fun setEnabled(enable: Boolean): Pair<Boolean,String> {
-        if (!hasPermission()) return false to "Shizuku n'est pas actif ou autorisé."
+    fun hasPermission(): Boolean {
         return try {
-            val cmd = if (enable) arrayOf("pm", "enable", AA) else arrayOf("pm", "disable-user", "--user", "0", AA)
-            val p: ShizukuRemoteProcess = Shizuku.newProcess(cmd, null, null)
-            val out = p.inputStream.bufferedReader().readText().trim()
-            val err = p.errorStream.bufferedReader().readText().trim()
-            val code = p.waitFor()
-            (code == 0) to (if (code == 0) out.ifBlank { "OK" } else err.ifBlank { "Erreur $code" })
-        } catch (t: Throwable) { false to (t.message ?: t.javaClass.simpleName) }
+            Shizuku.pingBinder() &&
+                Shizuku.checkSelfPermission() ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun requestPermission() {
+        try {
+            if (Shizuku.pingBinder() &&
+                Shizuku.checkSelfPermission() !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                Shizuku.requestPermission(1001)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun isEnabled(context: Context): Boolean {
+        return try {
+            val state =
+                context.packageManager.getApplicationEnabledSetting(
+                    ANDROID_AUTO
+                )
+
+            state != PackageManager.COMPONENT_ENABLED_STATE_DISABLED &&
+            state != PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    fun setEnabled(context: Context, enable: Boolean): Boolean {
+
+        if (!hasPermission()) return false
+
+        val latch = CountDownLatch(1)
+        var service: IPrivilegedService? = null
+
+        val connection = object : ServiceConnection {
+
+            override fun onServiceConnected(
+                name: ComponentName?,
+                binder: IBinder?
+            ) {
+                service =
+                    IPrivilegedService.Stub.asInterface(binder)
+
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(
+                name: ComponentName?
+            ) {
+                service = null
+            }
+        }
+
+        val args = Shizuku.UserServiceArgs(
+            ComponentName(
+                context,
+                PrivilegedService::class.java
+            )
+        )
+            .daemon(false)
+            .version(1)
+
+        return try {
+
+            Shizuku.bindUserService(args, connection)
+
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                false
+            } else {
+                service?.execute(enable) == 0
+            }
+
+        } catch (_: Exception) {
+            false
+
+        } finally {
+            try {
+                Shizuku.unbindUserService(
+                    args,
+                    connection,
+                    true
+                )
+            } catch (_: Exception) {
+            }
+        }
     }
 }
